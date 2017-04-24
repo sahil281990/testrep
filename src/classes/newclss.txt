@@ -1,0 +1,1106 @@
+public with sharing class NIKE_Allocations_Controller {
+
+    @AuraEnabled
+    public static void saveAllRecordsOnTheServer(Allocation__c allo, list<Allocation_Item__C> listAllAI){
+
+        
+        list<Allocation_Item__c> upsertAI = new list<Allocation_Item__c>();
+
+        try{
+            system.debug(LoggingLevel.DEBUG, '*** NIKE_Allocations_Controller: saveAllRecordsOnTheServer: Update allo');
+            update allo;
+            system.debug(LoggingLevel.DEBUG, '*** NIKE_Allocations_Controller: saveAllRecordsOnTheServer: Update listAllAI');
+            update listAllAI;
+            
+        }
+        catch(Exception e){
+            system.debug(LoggingLevel.ERROR, '*** NIKE_Allocations_Controller: saveAllRecordsOnTheServer: ERROR: '+ e.getMessage() + e.getStackTraceString());
+        }
+    }
+
+    @AuraEnabled
+    public static list<Allocation_Schedule_Item__c> getScheduleItemsForAllocationItem(Allocation_Item__c ai){
+        system.debug(LoggingLevel.DEBUG,'*** NIKE_Allocations_Controller: getScheduleItemsForAllocationItem: '+ ai);
+        list<Allocation_Schedule_Item__c> lASI = new list<Allocation_Schedule_Item__c>();
+        if(ai !=null){
+            try{
+                lASI = [select Id, Size__c, Quantity__c, Material__c
+                        from Allocation_Schedule_Item__c 
+                        where Allocation_Item__c = : ai.Id];
+            }
+            catch(Exception e){
+                system.debug(LoggingLevel.ERROR, '*** NIKE_Allocations_Controller: getScheduleItemsForAllocationItem: ERROR: '+ e.getMessage());
+                lASI = new list<Allocation_Schedule_Item__c>();
+            }
+
+            if(lASI.isEmpty()){
+                list<String> AvailableSizes = new list<String>();
+
+                if(String.isNotBlank(ai.Allocation_Product__r.Product__r.Available_Sizes__c)){
+                    AvailableSizes = ai.Allocation_Product__r.Product__r.Available_Sizes__c.split(';');
+                    for(String s: AvailableSizes){
+                        Allocation_Schedule_Item__c asi = new Allocation_Schedule_Item__c();
+                        asi.Allocation_Item__c = ai.Id;
+                        asi.Size__c = s;
+                        asi.Quantity__c = 0;
+                        lASI.add(asi);
+                    }
+                }
+                if(!lASI.isEmpty()){
+                    system.debug('*** '+lASI);
+                    insert lASI;
+                }
+                
+            }
+            
+        }
+
+        return lASI;
+    }
+
+    @AuraEnabled
+    public static void SaveScheduleItemsForAllocationItem(list<Allocation_Schedule_Item__c> allocationScheduleItems){
+        system.debug(LoggingLevel.DEBUG, '*** SaveScheduleItemsForAllocationItem: ' +allocationScheduleItems);
+        update allocationScheduleItems;
+    }
+    
+    @AuraEnabled public static void deleteAllocation(Id allocationId){
+        //Query the allocation products, allocation accounts and allocation items linked to the allocation
+        list<Allocation_Product__c> lAProduct = [SELECT Id 
+                                                 FROM   Allocation_Product__c 
+                                                 WHERE  Allocation__c = :allocationId];
+        list<Allocation_Account__c> lAAccount = [SELECT Id 
+                                                 FROM   Allocation_Account__c 
+                                                 WHERE  Allocation__c = :allocationId];
+        list<Allocation_Item__c> lAItem = [SELECT   Id 
+                                           FROM     Allocation_Item__c 
+                                           WHERE    Allocation__c = :allocationId]; 
+        
+        Allocation__c allocation = [SELECT Id FROM Allocation__c WHERE Id = :allocationId];
+        
+        //delete records
+        try{
+            if(lAProduct.size() > 0){
+                delete lAProduct;    
+            }
+            if(lAAccount.size() > 0){
+                delete lAAccount;
+            }
+            if(lAItem.size() > 0){
+                delete lAItem;
+            }
+            delete allocation;
+        } catch(Exception e){
+            //TODO handle exception
+        }
+    }
+    
+    @AuraEnabled
+    public static void saveAllocationItems(String allocationItems, String allocationId){ 
+        //Lists to store allocation items to insert, update or delete
+        list<Allocation_Item__c> lNewAllocationItems = new list<Allocation_Item__c>();
+        list<Allocation_Item__c> lUpdatedAllocationItems = new list<Allocation_Item__c>();
+        list<Allocation_Item__c> lDeletedAllocationItems = new list<Allocation_Item__c>();
+        
+        
+        //List of allocation wrappers
+        list<allocationWrapper> lAllocationWrappers = parseAllocationItems(allocationItems);
+               
+        //Map of allocation Id and quantity
+        System.debug('Begin map ' + Limits.getCpuTime());
+        map<Id, Integer> mQuantities = new map<Id, Integer>();
+        map<String, Id> mAlloItems = new map<String, Id>();
+        map<Id, Allocation_Item__c> mAlloItemsIds = new map<Id, Allocation_Item__c>();
+        for(Allocation_Item__c alloItem : [SELECT   Id, 
+                                                    Quantity__c,
+                                                    Allocation_Product__c,
+                                                    Allocation_Account__c,
+                                                    Allocation_Product__r.Product__r.Available_Sizes__c,
+                                                    Allocation_Product__r.Product__r.ProductCode
+                                           FROM     Allocation_Item__c
+                                           WHERE    Allocation__c = :allocationId]){
+            mQuantities.put(alloItem.Id, Integer.valueOf(alloItem.Quantity__c));
+            mAlloItems.put(String.valueOf(alloItem.Allocation_Product__c) + String.valueOf(alloItem.Allocation_Account__c), alloItem.Id);                    
+            mAlloItemsIds.put(alloItem.Id, alloItem);
+        }
+        System.debug('End map ' + Limits.getCpuTime());
+        
+        //Populate the static map mAllocationItems. This map contains all the allocation 
+        //item linked to the allocation.
+        getAllocationItemsMap(lAllocationWrappers);       
+        
+        //Loop over the allocation wrappers and determine if the allocation should be
+        //inserted, updated or deleted.        
+        for(allocationWrapper aw: lAllocationWrappers){
+            System.debug('Begin for loop' + Limits.getCpuTime());
+            Decimal value;
+            if(aw.value.length() > 0){
+                value = Decimal.valueOf(aw.value);    
+            } else{
+                value = 0;
+            }
+            System.debug('value is: ' + value);
+            if(isNewAllocation(lAllocationWrappers, aw, mAlloItems.keySet()) && value > 0){ 
+                System.debug('Insert new allocation item');
+                //Insert new allocation items
+                lNewAllocationItems.add(
+                    new Allocation_Item__c(
+                        Allocation__c = aw.allocationId,
+                        Quantity__c = value,
+                        Allocation_Product__c = aw.aProductId,
+                        Allocation_Account__c = aw.aAccountId
+                        /*
+                        Size_10__c = aw.sizes.size10,
+                        Size_10_5__c = aw.sizes.size10_5,
+                        Size_11__c = aw.sizes.size11,
+                        Size_11_5__c = aw.sizes.size11_5,
+                        Size_12__c = aw.sizes.size12,
+                        Size_12_5__c = aw.sizes.size12_5,
+                        Size_13__c = aw.sizes.size13,
+                        Size_13_5__c = aw.sizes.size13_5,
+                        Size_14__c = aw.sizes.size14,
+                        Size_15__c = aw.sizes.size15,
+                        Size_5__c = aw.sizes.size5,
+                        Size_5_5__c = aw.sizes.size5_5,
+                        Size_6__c = aw.sizes.size6,
+                        Size_6_5__c = aw.sizes.size6_5,
+                        Size_7__c = aw.sizes.size7,
+                        Size_7_5__c = aw.sizes.size7_5,
+                        Size_8__c = aw.sizes.size8,
+                        Size_8_5__c = aw.sizes.size8_5,
+                        Size_9__c = aw.sizes.size9,
+                        Size_9_5__c = aw.sizes.size9_5
+                        */
+                    )
+                );         
+            } else{
+                Id allocationItemId = getAllocationItem(aw, mAlloItems);
+                
+                //Verify if records need to be update
+                System.debug('check if update is required');
+                System.debug(mQuantities.get(allocationItemId));
+                System.debug(value);
+                System.debug(mQuantities.get(allocationItemId) != value);
+                if(mQuantities.get(allocationItemId) != null && mQuantities.get(allocationItemId) != value){
+                    System.debug('update existing allocation item ' + allocationItemId);
+                    //update existing allocation items
+
+                    if(value > 0){
+                        lUpdatedAllocationItems.add(
+                            new Allocation_Item__c(
+                                Id = allocationItemId,
+                                Allocation__c = aw.allocationId,
+                                Quantity__c = value,
+                                Allocation_Product__c = aw.aProductId,
+                                Allocation_Account__c = aw.aAccountId
+                            )               
+                        );
+                    } else{
+                        //delete allocation items
+                        System.debug('delete allocation item');
+                        lDeletedAllocationItems.add(mAlloItemsIds.get(allocationItemId));
+                    } 
+                }
+            }
+        }
+        
+        System.debug('Size of lNewAllocationItems is: ' + lNewAllocationItems.size());
+        System.debug('Size of lUpdatedAllocationItems is: ' + lUpdatedAllocationItems.size());
+        System.debug('Size of lDeletedAllocationItems is: ' + lDeletedAllocationItems.size());
+        
+        try{
+            if(lNewAllocationItems.size() > 0){
+                insert lNewAllocationItems;    
+            }
+            if(lUpdatedAllocationItems.size() > 0){
+                update lUpdatedAllocationItems;
+            }
+            if(lDeletedAllocationItems.size() > 0){
+                System.debug('begin delete');
+                delete lDeletedAllocationItems;
+                System.debug('end delete');
+            }
+        } catch(Exception e){
+            //TODO: handle exception
+        }
+    }
+    
+    public static map<Id, Allocation_Item__c> mAllocationItems;
+    public static void getAllocationItemsMap(list<allocationWrapper> lAllocationWrappers){
+        //map<Id, Allocation_Item__c> mAllocationItems;
+        list<Id> lAllocationIds = new list<Id>();
+        list<Id> lAllocationProductIds = new list<Id>();
+        list<Id> lAllocationAccountIds = new list<Id>();        
+        
+        //Lazy instantiation
+        if(mAllocationItems == null){
+            for(allocationWrapper aw : lAllocationWrappers){
+                lAllocationIds.add(aw.allocationId);
+                lAllocationProductIds.add(aw.aProductId);
+                lAllocationAccountIds.add(aw.aAccountId);
+            }            
+        
+            mAllocationItems = new map<Id, Allocation_Item__c>(
+                [SELECT     Id,
+                            Allocation__c,
+                            Allocation_Product__c,
+                            Allocation_Account__c,
+                            Allocation_Product__r.Product__r.Available_Sizes__c,
+                            Allocation_Product__r.Product__r.ProductCode
+                 FROM       Allocation_Item__c 
+                 WHERE      Allocation__c IN :lAllocationIds
+                 AND        Allocation_Product__c IN :lAllocationProductIds
+                 AND        Allocation_Account__c IN :lAllocationAccountIds]
+            );            
+        }
+    }
+    
+    
+    public static Boolean isNewAllocation(list<allocationWrapper> lAllocationWrapper, allocationWrapper aw, set<String> sAlloItems){
+        System.debug(String.valueOf(aw.aProductId) + String.valueOf(aw.aAccountId));
+        if(sAlloItems.contains(String.valueOf(aw.aProductId) + String.valueOf(aw.aAccountId))){
+            System.debug('isNewAllocation is false');
+            return false;
+        } else{
+            System.debug('isNewAllocation is true');
+            return true;
+        }
+        
+        //if(mAllocationItems.size() > 0){
+            //for(Allocation_Item__c ai : mAllocationItems.values()){
+                //sAlloItems.add(String.valueOf(ai.Allocation_Product__c) + String.valueOf(ai.Allocation_Account__c));
+                
+                /*
+                if(ai.Allocation__c == aw.allocationId && 
+                   ai.Allocation_Product__c == aw.aProductId &&
+                   ai.Allocation_Account__c == aw.aAccountId){
+                       System.debug('end isNewAllocation()' + Limits.getCpuTime());
+                       return false;
+                */
+                //}
+            
+            //for(Allocation_Item__c alloItem : mAllocationItems.values()){
+                //if(sAlloItems.contains(String.valueOf(alloItem.Allocation_Product__c) + String.valueOf(alloItem.Allocation_Account__c))){
+                   // System.debug('end isNewAllocation()' + Limits.getCpuTime());
+                    //return false;
+               // }
+           // }
+    }
+    
+    
+    public static Id getAllocationItem(allocationWrapper aw, map<String, Id> mAlloItems){
+        System.debug('begin getAllocationItem() ' + Limits.getCpuTime());
+        Id allocationItem;
+        
+        String keyId = String.valueOf(aw.aProductId)+ String.valueOf(aw.aAccountId);
+        if(mAlloItems.containsKey(keyId)){
+            allocationItem = mAlloItems.get(keyId);
+        }
+        
+        /*
+        for(Allocation_Item__c ai : mAllocationItems.values()){
+            if(ai.Allocation__c == aw.allocationId && 
+               ai.Allocation_Product__c == aw.aProductId &&
+               ai.Allocation_Account__c == aw.aAccountId){
+                   allocationItem = ai;
+                   System.debug('Allocation item found');
+               }
+        }
+        */
+        System.debug('end getAllocationItem() ' + Limits.getCpuTime());
+        System.debug('allocationItem is: ' + allocationItem);
+        return allocationItem;
+    }
+    
+    
+    public static list<allocationWrapper> parseAllocationItems(String allocationItems){
+        list<allocationWrapper> lAllocationItems = new list<allocationWrapper>();
+        JSONParser parser = JSON.createParser(allocationItems);
+        
+        while(parser.nextToken() != JSONToken.END_ARRAY){
+            allocationWrapper allocationItem = new allocationWrapper();
+            while (parser.nextToken() != JSONToken.END_OBJECT) {
+                if (parser.getCurrentToken() == JSONToken.FIELD_NAME) {
+                    String text = parser.getText();
+                    if (parser.nextToken() != JSONToken.VALUE_NULL) {
+                        if (text == 'allocationId') {
+                            allocationItem.allocationId = parser.getText();
+                        } else if (text == 'aAccountId') {
+                            allocationItem.aAccountId = parser.getText();
+                        } else if (text == 'aProductId') {
+                            allocationItem.aProductId = parser.getText();
+                        } else if (text == 'value') {
+                            allocationItem.value = parser.getText();
+                        } else if (text == 'sizes') {
+                            allocationItem.sizes = new Sizes(parser);
+                        } 
+                    }
+                }
+            }
+            lAllocationItems.add(allocationItem);
+        }
+        System.debug(lAllocationItems);
+        return lAllocationItems;
+    }
+    
+    
+    public class Sizes {
+        public Integer size5 {get;set;} 
+        public Integer size6 {get;set;} 
+        public Integer size7 {get;set;} 
+        public Integer size8 {get;set;} 
+        public Integer size9 {get;set;} 
+        public Integer size10 {get;set;} 
+        public Integer size11 {get;set;} 
+        public Integer size12 {get;set;} 
+        public Integer size13 {get;set;} 
+        public Integer size14 {get;set;} 
+        public Integer size15 {get;set;} 
+        public Integer size5_5 {get;set;} 
+        public Integer size6_5 {get;set;} 
+        public Integer size7_5 {get;set;} 
+        public Integer size8_5 {get;set;} 
+        public Integer size9_5 {get;set;} 
+        public Integer size10_5 {get;set;} 
+        public Integer size11_5 {get;set;} 
+        public Integer size12_5 {get;set;} 
+        public Integer size13_5 {get;set;} 
+
+        public Sizes(JSONParser parser) {
+            while (parser.nextToken() != JSONToken.END_OBJECT) {
+                if (parser.getCurrentToken() == JSONToken.FIELD_NAME) {
+                    String text = parser.getText();
+                    if (parser.nextToken() != JSONToken.VALUE_NULL) {                    
+                    system.debug('---------text -------------'+text );
+                        if (text == '5') {
+                            if(parser.getText().length() > 0){
+                                size5 = Integer.valueOf(parser.getText());
+                            } else{
+                                size5 = 0;
+                            }
+                        } else if (text == '6') {
+                            if(parser.getText().length() > 0){
+                                size6 = Integer.valueOf(parser.getText());    
+                            } else{
+                                size6 = 0;
+                            }
+                        } else if (text == '7') {
+                            if(parser.getText().length() > 0){
+                                size7 = Integer.valueOf(parser.getText());    
+                            } else{
+                                size7 = 0;
+                            }
+                        } else if (text == '8') {
+                            if(parser.getText().length() > 0){
+                                size8 = Integer.valueOf(parser.getText());    
+                            } else{
+                                size8 = 0;
+                            }
+                        } else if (text == '9') {
+                            if(parser.getText().length() > 0){
+                                size9 = Integer.valueOf(parser.getText());    
+                            } else{
+                                size9 = 0;
+                            }
+                        } else if (text == '10') {
+                            if(parser.getText().length() > 0){
+                                size10 = Integer.valueOf(parser.getText());    
+                            } else{
+                                size10 = 0;
+                            }
+                        } else if (text == '11') {
+                            if(parser.getText().length() > 0){
+                                size11 = Integer.valueOf(parser.getText());    
+                            } else{
+                                size11 = 0;
+                            }
+                        } else if (text == '12') {
+                            if(parser.getText().length() > 0){
+                                size12 = Integer.valueOf(parser.getText());    
+                            } else{
+                                size12 = 0;
+                            }
+                        } else if (text == '13') {
+                            if(parser.getText().length() > 0){
+                                size13 = Integer.valueOf(parser.getText());    
+                            } else{
+                                size13 = 0;
+                            }
+                        } else if (text == '14') {
+                            if(parser.getText().length() > 0){
+                                size14 = Integer.valueOf(parser.getText());    
+                            } else{
+                                size14 = 0;
+                            }
+                        } else if (text == '15') {
+                            if(parser.getText().length() > 0){
+                                size15 = Integer.valueOf(parser.getText());    
+                            } else{
+                                size15 = 0;
+                            }
+                        } else if (text == '5.5') {
+                            if(parser.getText().length() > 0){
+                                size5_5 = Integer.valueOf(parser.getText());    
+                            } else{
+                                size5_5 = 0;
+                            }
+                        } else if (text == '6.5') {
+                            if(parser.getText().length() > 0){
+                                size6_5 = Integer.valueOf(parser.getText());
+                            } else{
+                                size6_5 = 0;
+                            }
+                        } else if (text == '7.5') {
+                            if(parser.getText().length() > 0){
+                                size7_5 = Integer.valueOf(parser.getText());    
+                            } else{
+                                size7_5 = 0;
+                            }
+                        } else if (text == '8.5') {
+                            if(parser.getText().length() > 0){
+                                size8_5 = Integer.valueOf(parser.getText());    
+                            } else{
+                                size8_5 = 0;
+                            }
+                        } else if (text == '9.5') {
+                            if(parser.getText().length() > 0){
+                                size9_5 = Integer.valueOf(parser.getText());    
+                            } else{
+                                size9_5 = 0;
+                            }
+                        } else if (text == '10.5') {
+                            if(parser.getText().length() > 0){
+                                size10_5 = Integer.valueOf(parser.getText());    
+                            } else{
+                                size10_5 = 0;
+                            }
+                        } else if (text == '11.5') {
+                            if(parser.getText().length() > 0){
+                                size11_5 = Integer.valueOf(parser.getText());    
+                            } else{
+                                size11_5 = 0;
+                            }
+                        } else if (text == '12.5') {
+                            if(parser.getText().length() > 0){
+                                size12_5 = Integer.valueOf(parser.getText());    
+                            } else{
+                                size12_5 = 0;
+                            }
+                        } else if (text == '13.5') {
+                            if(parser.getText().length() > 0){
+                                size13_5 = Integer.valueOf(parser.getText());    
+                            } else{
+                                size13_5 = 0;
+                            }
+                        } 
+                    }
+                }
+            }
+        }
+    }
+    
+    
+    public class allocationWrapper{
+        public String aProductId {get;set;} 
+        public String aAccountId {get;set;}
+        public String value {get;set;}
+        public String allocationId {get;set;}
+        public Sizes sizes {get;set;}
+    }
+    
+
+    @AuraEnabled
+    public static Allocation__c getAllocationInContext(Id allocationId){
+        System.debug('getAllocationInContext triggered');
+        return [SELECT  Id, 
+                        Name, 
+                        Season_Picklist__c, 
+                        Flow_picklist__c
+                FROM    Allocation__C 
+                WHERE   Id = :allocationId];
+    }
+    
+    
+    @AuraEnabled
+    public static Boolean isNew(Id allocationId){
+        Integer numAAccounts = [SELECT  count() 
+                                FROM    Allocation_Product__c 
+                                WHERE   Allocation__c = :allocationId];
+        
+        Integer numAProducts = [SELECT  count() 
+                                FROM    Allocation_Account__c 
+                                WHERE   Allocation__c = :allocationId];
+        
+        return numAAccounts + numAProducts == 0;
+    }
+    
+       
+    public static list<columnWrapper> getColumns(list<Allocation_Account__c> lAllocationAccounts){
+        list<columnWrapper> lColumnWrapper = new list<columnWrapper>();
+        
+        for(Allocation_Account__c aAccount : lAllocationAccounts){
+            columnWrapper cWrapper = new columnWrapper();
+            String accountLevel = aAccount.Account_Level__c;
+            if(accountLevel == 'G7'){
+                cWrapper.columnName = accountLevel + ': ' + aAccount.Account__r.Name;
+                //cWrapper.columnId = aAccount.Account__r.Id;
+                cWrapper.aAccountId = aAccount.Id;
+            } else if(accountLevel == 'R8'){
+                cWrapper.columnName = accountLevel + ': ' + aAccount.Account__r.Name;
+                //cWrapper.columnId = aAccount.Account__r.Id;
+                cWrapper.aAccountId = aAccount.Id;
+            } else if(accountLevel == 'YG'){
+                cWrapper.columnName = accountLevel + ': ' + aAccount.Account__r.Name;
+                //cWrapper.columnId = aAccount.Account__r.Id;
+                cWrapper.aAccountId = aAccount.Id;                
+            } else if(accountLevel == 'Territory'){
+                cWrapper.columnName = accountLevel + ': ' + aAccount.Territory__r.Name;
+                //cWrapper.columnId = aAccount.Territory__r.Id;                
+                cWrapper.aAccountId = aAccount.Id;
+            } else if(accountLevel == 'Account'){
+                cWrapper.columnName = accountLevel + ': ' + aAccount.Account__r.Name;
+                //cWrapper.columnId = aAccount.Account__r.Id;
+                cWrapper.aAccountId = aAccount.Id;
+            } else if(accountLevel == 'Sold-to'){
+                cWrapper.columnName = accountLevel + ': ' + aAccount.Account__r.Name;
+                //cWrapper.columnId = aAccount.Account__r.Id;
+                cWrapper.aAccountId = aAccount.Id;
+            } else if(accountLevel == 'Ship to'){
+                cWrapper.columnName = accountLevel + ': ' + aAccount.Account__r.Name;
+                //cWrapper.columnId = aAccount.Account__r.Id;
+                cWrapper.aAccountId = aAccount.Id;                
+            }
+            System.debug(cWrapper);
+            lColumnWrapper.add(cWrapper);
+        }        
+        return lColumnWrapper;
+    }
+       
+    
+    public static Allocation_Item__c getAllocationItem(Allocation_Account__c aAccount, 
+                                                        Allocation_Product__c aProduct,
+                                                         String allocationId){
+        
+        Allocation_Item__c allocationItem = new Allocation_Item__c();
+                                                             
+        list<Allocation_Item__c> lAllo = [SELECT    Id,
+                                                    Quantity__c,
+                                                    Allocation_Product__r.Product__r.Available_Sizes__c,
+                                                    Allocation_Product__r.Product__r.ProductCode
+
+                                          FROM      Allocation_Item__c 
+                                          WHERE     Allocation__c = :allocationId
+                                          AND       Allocation_Product__c = :aProduct.Id
+                                          AND       Allocation_Account__c = :aAccount.Id];
+        
+        //Create new allocation item record if none has been found.
+        if(lAllo.size() == 0){
+            String productLevel = aProduct.Product_Level__c;                  
+            if(productLevel == 'Style Family'){
+                allocationItem.Style_Family__c = aProduct.Style_Family__c;
+            } else if(productLevel == 'Style'){
+                allocationItem.Style__c = aProduct.Style__c;
+            } else if(productLevel == 'Material'){
+                allocationItem.Product__c = aProduct.Product__c;
+            } 
+        } else{
+            //Use found allocation item
+            allocationItem = lAllo[0];     
+        }
+        return allocationItem;
+    }
+    
+    public static Allocation_Item__c getAllocationItem(Allocation_Account__c aAccount, 
+                                                        Allocation_Product__c aProduct,
+                                                         String allocationId,
+                                                          list<Allocation_Item__c> lAllocationItems){
+        System.debug('begin getAllocationItem()' + Limits.getCpuTime());
+        Allocation_Item__c allocationItem = new Allocation_Item__c();
+        
+        //Check if an allocation item already exists. If so, return that allocation item.
+        if(lAllocationItems.size() > 0){
+            for(Allocation_Item__c ai : lAllocationItems){
+                if(ai.Allocation__c == allocationId && 
+                    ai.Allocation_Product__c == aProduct.Id &&
+                     ai.Allocation_Account__c == aAccount.Id){
+                       allocationItem = ai;
+                       break;
+                }
+            }  
+            //If no allocation item exist, return a new allocation item.
+        } else{
+            String productLevel = aProduct.Product_Level__c;                  
+            if(productLevel == 'Style Family'){
+                allocationItem.Style_Family__c = aProduct.Style_Family__c;
+            } else if(productLevel == 'Style'){
+                allocationItem.Style__c = aProduct.Style__c;
+            } else if(productLevel == 'Material'){
+                allocationItem.Product__c = aProduct.Product__c;
+            }
+        }
+                                                                      
+                                                              
+        /*                                                                  
+        list<Allocation_Item__c> lAllo = [SELECT    Id,
+                                                    Quantity__c,
+                                                    Size_10__c,
+                                                    Size_10_5__c,
+                                                    Size_11__c,
+                                                    Size_11_5__c,
+                                                    Size_12__c,
+                                                    Size_12_5__c,
+                                                    Size_13__c,
+                                                    Size_13_5__c,
+                                                    Size_14__c,
+                                                    Size_15__c,
+                                                    Size_5__c,
+                                                    Size_5_5__c,
+                                                    Size_6__c,
+                                                    Size_6_5__c,
+                                                    Size_7__c,
+                                                    Size_7_5__c,
+                                                    Size_8__c,
+                                                    Size_8_5__c,
+                                                    Size_9__c,
+                                                    Size_9_5__c
+                                          FROM      Allocation_Item__c 
+                                          WHERE     Allocation__c = :allocationId
+                                          AND       Allocation_Product__c = :aProduct.Id
+                                          AND       Allocation_Account__c = :aAccount.Id];
+        */
+        
+        //Create new allocation item record if none has been found.
+        
+        /*
+        if(lAllo.size() == 0){
+            String productLevel = aProduct.Product_Level__c;                  
+            if(productLevel == 'Style Family'){
+                allocationItem.Style_Family__c = aProduct.Style_Family__c;
+            } else if(productLevel == 'Style'){
+                allocationItem.Style__c = aProduct.Style__c;
+            } else if(productLevel == 'Material'){
+                allocationItem.Product__c = aProduct.Product__c;
+            } 
+        } else{
+            //Use found allocation item
+            allocationItem = lAllo[0];     
+        }
+        */
+        System.debug('end getAllocationItem()' + Limits.getCpuTime());
+        return allocationItem;
+    }    
+    
+    
+    public static Id getRowId(Allocation_Product__c aProduct){
+        Id rowId;
+        String productLevel = aProduct.Product_Level__c;                  
+        if(productLevel == 'Style Family'){
+            rowId = aProduct.Style_Family__r.Id;
+        } else if(productLevel == 'Style'){
+            rowId = aProduct.Style__r.Id;
+        } else if(productLevel == 'Material'){
+            rowId = aProduct.Product__r.Id;
+        }   
+        return rowId;
+    }
+    
+    public static String getRowName(Allocation_Product__c aProduct){
+        String rowName;
+        String productLevel = aProduct.Product_Level__c;  
+        
+        if(productLevel == 'Style Family'){
+            rowName = productLevel + ': ' + aProduct.Style_Family__r.Name;
+        } else if(productLevel == 'Style'){
+            rowName = productLevel + ': ' + aProduct.Style__r.Name;
+        } else if(productLevel == 'Material'){
+            rowName = productLevel + ': ' + aProduct.Product__r.Name;
+        }        
+        return rowName;
+    }    
+    
+    @AuraEnabled
+    public static AllocationItemWrapper getAllocationItems(String allocationId){
+        system.debug(LoggingLevel.DEBUG, '*** NIKE_Allocations_Controller: getAllocationItems: allocationId: ' + allocationId);
+
+        //Return variable
+        AllocationItemWrapper AI_Array = new AllocationItemWrapper();
+        
+        //List of allocation accounts and allocation products
+        list<Allocation_Account__c> lAllocationAccounts = [SELECT    Account__r.Name,
+                                                                     Account_Level__c, 
+                                                                     Territory__r.Name 
+                                                           FROM      Allocation_Account__c 
+                                                           WHERE     Allocation__c = :allocationId];   
+        System.debug(lAllocationAccounts.size());
+        
+        list<Allocation_Product__c> lAllocationProducts = [SELECT    Product__r.Name,
+                                                                     Product_Category__c, 
+                                                                     Product_Level__c,
+                                                                     Style__r.Name,
+                                                                     Style_Family__r.Name
+                                                            FROM     Allocation_Product__c 
+                                                            WHERE    Allocation__c = :allocationId];       
+        
+        map<String, Allocation_Item__c> mapAllocationItems = new map<String, Allocation_Item__c>();
+        for(Allocation_Item__c alloItem : [SELECT  Id,
+                                                   Quantity__c,
+                                                   Allocation__c,
+                                                   Allocation_Account__c,
+                                                   Allocation_Account__r.Id,
+                                                   Allocation_Product__c,
+                                                   Allocation_Product__r.Id,
+                                                   Allocation_Product__r.Product__r.Available_Sizes__c,
+                                                   Allocation_Product__r.Product__r.ProductCode
+                                                   FROM     Allocation_Item__c
+                                                   WHERE    Allocation__c = :allocationId]){
+            mapAllocationItems.put(String.valueOf(alloItem.Allocation_Account__r.Id) + String.valueOf(alloItem.Allocation_Product__r.Id), alloItem);           
+        }
+
+        //Store the column (account level) names
+        System.debug(AI_Array.columnWrapper);
+        AI_Array.columnWrapper = getColumns(lAllocationAccounts);
+        System.debug(AI_Array.columnWrapper);
+        
+        //Loop over the allocation products and create AllocationsRow records
+        for(Allocation_Product__c aProduct : lAllocationProducts){
+            String aProductId = aProduct.Id;
+            
+            AllocationsRow allocationRow = new AllocationsRow();
+            allocationRow.rowId = getRowId(aProduct);
+            allocationRow.rowName = getRowName(aProduct);
+            allocationRow.aProductId = aProduct.Id;
+            
+            //Populate the listAI list
+            for(Allocation_Account__c aAccount : lAllocationAccounts){
+                
+                String itemIdentifier = aAccount.Id + aProductId;
+                if(mapAllocationItems.containsKey(itemIdentifier)){
+                    allocationRow.listAI.add(mapAllocationItems.get(itemIdentifier)); 
+                } else{
+                    allocationRow.listAI.add(new Allocation_Item__c()); 
+                }
+            }
+            AI_Array.rows.add(allocationRow);
+            if(AI_Array.rows.size() > 1000){
+                break;
+            }
+        }
+        return AI_Array;
+    }
+
+    public class AllocationItemWrapper{
+        @AuraEnabled public list<columnWrapper> columnWrapper = new list<columnWrapper>();
+        @AuraEnabled public list<AllocationsRow> rows = new list<AllocationsRow>();
+    }
+
+    public class AllocationsRow{
+        @AuraEnabled public String rowName;
+        @AuraEnabled public Id rowId;
+        @AuraEnabled public Id aProductId;
+        @AuraEnabled public list<Allocation_Item__c> listAI = new list<Allocation_Item__c>();
+    }
+    
+    public class columnWrapper{
+        @AuraEnabled public String columnName;
+        @AuraEnabled public Id columnId;
+        @AuraEnabled public Id aAccountId;
+    }    
+
+    @AuraEnabled
+    public static list<Product2> productSearch(String searchstring){
+        
+        /**
+         * SOSL Query to get more hits
+         */
+        list<Product2> lProducts    = new list<Product2>();
+        String ObjectsString        =  'Product2(Id,Name Order By Name ASC) ';
+        String searchquery          = 'FIND\''+searchstring+'\' IN Name FIELDS RETURNING ' + ObjectsString;
+        List<List <sObject>> searchList = search.query(searchquery);
+        lProducts = ((List<Product2>)searchList[0]);
+
+        return lProducts;
+    }
+    
+    
+    @AuraEnabled
+    public static list<Style__c> styleSearch(String searchstring){
+        
+        /**
+         * SOSL Query to get more hits
+         */
+        list<Style__c> lStyles  = new list<Style__c>();
+        String ObjectsString        =  'Style__c(Id,Name Order By Name ASC) ';
+        String searchquery          = 'FIND\''+searchstring+'\' IN Name FIELDS RETURNING ' + ObjectsString;
+        List<List <sObject>> searchList = search.query(searchquery);
+        lStyles = ((List<Style__c>)searchList[0]); 
+
+        return lStyles;
+    }    
+    
+
+    @AuraEnabled
+    public static list<Style_Family__c> styleFamilySearch(String searchstring){
+        
+        /**
+         * SOSL Query to get more hits
+         */
+        list<Style_Family__c> lStyleFamilies    = new list<Style_Family__c>();
+        String ObjectsString        =  'Style_Family__c(Id,Name Order By Name ASC) ';
+        String searchquery          = 'FIND\''+searchstring+'\' IN Name FIELDS RETURNING ' + ObjectsString;
+        List<List <Style_Family__c>> searchList = search.query(searchquery);
+        lStyleFamilies = ((List<Style_Family__c>)searchList[0]);
+
+        return lStyleFamilies;
+    }    
+    
+    
+    @AuraEnabled
+    public static list<Territory__c> territorySearch(String searchstring){
+        
+        /**
+         * SOSL Query to get more hits
+         */
+        list<Territory__c> lTerritories     = new list<Territory__c>();
+        String ObjectsString        =  'Territory__c(Id,Name Order By Name ASC) ';
+        String searchquery          = 'FIND\''+searchstring+'\' IN Name FIELDS RETURNING ' + ObjectsString;
+        List<List<Territory__c>> searchList = search.query(searchquery);
+        lTerritories = ((List<Territory__c>)searchList[0]); 
+
+        return lTerritories;
+    }   
+
+    
+    @AuraEnabled
+    public static list<Account> accountSearch(String searchstring){ 
+        Id customerRecordTypeId = [SELECT   Id 
+                                   FROM     RecordType 
+                                   WHERE    DeveloperName = 'Customer'
+                                   LIMIT    1].Id;
+        
+        /**
+         * SOSL Query to get more hits 
+         */
+        list<Account> lAccounts     = new list<Account>();
+        String ObjectsString        =  'Account(Id,Name WHERE RecordTypeId = \'' + customerRecordTypeId + '\' Order By Name ASC) ';
+        String searchquery          = 'FIND\''+searchstring+'\' IN Name FIELDS RETURNING ' + ObjectsString;
+        List<List<Account>> searchList = search.query(searchquery);
+        lAccounts = ((List<Account>)searchList[0]); 
+
+        return lAccounts;
+    }
+    
+
+    @AuraEnabled
+    public static list<Account> accountSoldToSearch(String searchstring){ 
+        Id customerRecordTypeId = [SELECT   Id 
+                                   FROM     RecordType 
+                                   WHERE    DeveloperName = 'Customer'
+                                   LIMIT    1].Id;
+        
+        /**
+         * SOSL Query to get more hits 
+         */
+        list<Account> lAccounts     = new list<Account>();
+        String ObjectsString        =  'Account(Id,Name WHERE IsSoldTo__c = true AND RecordTypeId = \'' + customerRecordTypeId + '\' Order By Name ASC) ';
+        String searchquery          = 'FIND\''+searchstring+'\' IN Name FIELDS RETURNING ' + ObjectsString;
+        System.debug(searchquery);
+        List<List<Account>> searchList = search.query(searchquery);
+        lAccounts = ((List<Account>)searchList[0]); 
+
+        return lAccounts;
+    }    
+    
+
+    @AuraEnabled
+    public static list<Account> accountShipToSearch(String searchstring){ 
+        Id customerRecordTypeId = [SELECT   Id 
+                                   FROM     RecordType 
+                                   WHERE    DeveloperName = 'Customer'
+                                   LIMIT    1].Id;
+        
+        /**
+         * SOSL Query to get more hits 
+         */
+        list<Account> lAccounts     = new list<Account>();
+        String ObjectsString        =  'Account(Id,Name WHERE IsShipTo__c = true AND RecordTypeId = \'' + customerRecordTypeId + '\' Order By Name ASC) ';
+        String searchquery          = 'FIND\''+searchstring+'\' IN Name FIELDS RETURNING ' + ObjectsString;
+        System.debug(searchquery);
+        List<List<Account>> searchList = search.query(searchquery);
+        lAccounts = ((List<Account>)searchList[0]); 
+
+        return lAccounts;
+    }      
+
+    @AuraEnabled
+    public static void productSave(Allocation__c allocation, list<Product2> selectedproducts){
+
+        list<Allocation_Product__C> lAlloProd = new list<Allocation_Product__C>();
+
+        for(Product2 p: selectedproducts){
+            Allocation_Product__C ap = new Allocation_Product__C();
+            ap.Allocation__C = allocation.Id;
+            ap.Product__C = p.Id;
+            lAlloProd.add(ap);
+        }
+
+        insert lAlloProd;
+    }
+    
+    /*
+    public static list<allocationWrapper> parseAnswers(String JSONAnswers){}
+    */
+    
+    @AuraEnabled
+    private static void saveAnswers(String request, String allocationId){
+        
+        //Parse JSON request
+        List<Values> values = new List<Values>();
+        JSONParser parser = JSON.createParser(request);        
+        while(parser.nextToken() != JSONToken.END_ARRAY){
+            while (parser.nextToken() != JSONToken.END_OBJECT) {
+                if (parser.getCurrentToken() == JSONToken.FIELD_NAME) {
+                    String text = parser.getText();
+                    if (parser.nextToken() != JSONToken.VALUE_NULL) {
+                        if (text == 'values') {
+                            while (parser.nextToken() != JSONToken.END_ARRAY) {
+                                values.add(new Values(parser));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        //Instantiate list to hold allocation products and allocation accounts
+        list<Allocation_Product__c> lAProducts = new list<Allocation_Product__c>();
+        list<Allocation_Account__c> lAAccounts = new list<Allocation_Account__c>();
+        
+        //Get aggregate accounts (G7, R8 and YG)
+        list<Account> lG7Accounts = [SELECT Id 
+                                     FROM   Account 
+                                     WHERE  Account_Level2__c = 'Global'];
+        
+        list<Account> lR8Accounts = [SELECT Id 
+                                     FROM   Account 
+                                     WHERE  Account_Level2__c = 'Regional'];
+
+        list<Account> lYGAccounts = [SELECT Id 
+                                     FROM   Account 
+                                     WHERE  Account_Level2__c = 'Young Guns'];
+        
+        //Loop over parsed JSON request and create allocation product and allocation account records
+        for(Values value : values){
+            if(value.questionNumber == 1){
+                for(String recordId : value.answers){
+                    //Create allocation product records
+                    Allocation_Product__c aProduct = new Allocation_Product__c();
+                    aProduct.Allocation__c = allocationId;
+                    if(value.name == 'Material'){
+                        aProduct.Product__c = recordId;
+                    } else if(value.name == 'Style'){
+                        aProduct.Style__c = recordId;
+                    } else if(value.name == 'Style Family'){
+                        aProduct.Style_Family__c = recordId;
+                    }
+                    lAProducts.add(aProduct);
+                }
+            } else if(value.questionNumber == 2){
+                for(String recordId : value.answers){
+                    //Create allocation account records
+                    system.debug(value.name);
+                    if(value.name != 'Territory'){ 
+                        //Create allocation account records for G7 accounts
+                        if(value.name == 'G7'){
+                            for(Account g7Account : lG7Accounts){
+                                lAAccounts.add(new Allocation_Account__c(
+                                    Allocation__c = allocationId,
+                                    Account__c = g7Account.Id,
+                                    Account_Level__c = value.Name
+                                ));
+                            }
+                        //Create allocation account records for R8 accounts
+                        } else if(value.name == 'R8'){
+                            for(Account r8Account : lR8Accounts){
+                                lAAccounts.add(new Allocation_Account__c(
+                                    Allocation__c = allocationId,
+                                    Account__c = r8Account.Id,
+                                    Account_Level__c = value.Name
+                                ));
+                            }                            
+                        } 
+                        //Create allocation account records for YG accounts
+                        else if(value.name == 'YG'){
+                            System.debug('value.name == YG');
+                            for(Account ygAccount : lYGAccounts){
+                                System.debug(ygAccount);
+                                lAAccounts.add(new Allocation_Account__c(
+                                    Allocation__c = allocationId,
+                                    Account__c = ygAccount.Id,
+                                    Account_Level__c = value.Name
+                                ));
+                            }                            
+                        } 
+                        //Create allocation account records for individual accounts
+                        else{
+                            lAAccounts.add(new Allocation_Account__c(
+                                Allocation__c = allocationId,
+                                Account__c = recordId,
+                                Account_Level__c = value.Name 
+                            ));
+                        }                  
+                    } 
+                    //Create allocation account records for territory
+                    else{
+                        Allocation_Account__c aAccount = new Allocation_Account__c();
+                        aAccount.Allocation__c = allocationId;                        
+                        aAccount.Territory__c = recordId;
+                        aAccount.Account_Level__c = value.Name;
+                        lAAccounts.add(aAccount);
+                    }
+                }
+            }
+        }
+        
+        //Insert allocation product and allocation account records
+        try{     
+            insert lAProducts;
+            insert lAAccounts;
+        } catch(Exception e){
+            System.debug('exception occured');
+            //Handle exceptions
+        }
+    }
+    
+
+    public class Values{
+        public String name {get;set;}
+        public Integer questionNumber {get;set;}
+        public List<String> answers {get;set;}
+
+        //Constructor
+        public Values(JSONParser parser) {
+            while (parser.nextToken() != JSONToken.END_OBJECT) {
+                if (parser.getCurrentToken() == JSONToken.FIELD_NAME) {
+                    String text = parser.getText();
+                    if (parser.nextToken() != JSONToken.VALUE_NULL) {
+                        if (text == 'name') {
+                            name = parser.getText();
+                        } else if(text == 'questionNumber'){
+                            questionNumber = Integer.valueOf(parser.getText());
+                        } else if (text == 'answers') {
+                            answers = new List<String>();
+                            while (parser.nextToken() != JSONToken.END_ARRAY) {
+                                answers.add(parser.getText());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    private class Value {
+        public String name;
+        public List<String> answers;
+    }
+}
